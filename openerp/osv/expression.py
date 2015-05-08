@@ -157,7 +157,7 @@ DOMAIN_OPERATORS = (NOT_OPERATOR, OR_OPERATOR, AND_OPERATOR)
 # operators are also used. In this case its right operand has the form (subselect, params).
 TERM_OPERATORS = ('=', '!=', '<=', '<', '>', '>=', '=?', '=like', '=ilike',
                   'like', 'not like', 'ilike', 'not ilike', 'in', 'not in',
-                  'child_of')
+                  'child_of', 'parent_of')
 
 # A subset of the above operators, with a 'negative' semantic. When the
 # expressions 'in NEGATIVE_TERM_OPERATORS' or 'not in NEGATIVE_TERM_OPERATORS' are used in the code
@@ -581,7 +581,7 @@ class ExtendedLeaf(object):
             - a valid leaf has a field objects unless
                 - it is not a tuple
                 - it is an inherited field
-                - left is id, operator is 'child_of'
+                - left is id, operator is either 'child_of' or 'parent_of'
                 - left is in MAGIC_COLUMNS
         """
         if not is_operator(self.leaf) and not is_leaf(self.leaf, True):
@@ -732,6 +732,26 @@ class expression(object):
                     return ids + recursive_children(ids2, model, parent_field)
                 return [(left, 'in', recursive_children(ids, left_model, parent or left_model._parent_name))]
 
+        def parent_of_domain(left, ids, left_model, parent=None, prefix='', context=None):
+            """ Return a domain implementing the parent_of operator for [(left,'parent_of',ids)]
+                as [(left,'in',parent_ids)] """
+            query = """ WITH RECURSIVE res AS
+                        (   SELECT id
+                              FROM {table}
+                             WHERE id IN %s
+                            UNION ALL
+                            SELECT p.{parent_field} AS id
+                              FROM res c JOIN {table} p ON p.id = c.id
+                             WHERE p.{parent_field} IS NOT NULL
+                        ) SELECT id FROM res
+                    """.format(table=left_model._table, parent_field=parent or left_model._parent_name)
+            cr.execute(query, (tuple(ids),))
+            ids2 = [r[0] for r in cr.fetchall()]
+            return [(left, 'in', ids2)]
+
+        parent_child_domain = {'child_of': child_of_domain,
+                               'parent_of': parent_of_domain}
+
         def pop():
             """ Pop a leaf to process. """
             return self.stack.pop()
@@ -798,9 +818,9 @@ class expression(object):
                 leaf.add_join_context(next_model, model._inherits[next_model._name], 'id', model._inherits[next_model._name])
                 push(leaf)
 
-            elif left == 'id' and operator == 'child_of':
+            elif left == 'id' and operator in ['child_of', 'parent_of']:
                 ids2 = to_ids(right, model, context)
-                dom = child_of_domain(left, ids2, model)
+                dom = parent_child_domain[operator](left, ids2, model)
                 for dom_leaf in reversed(dom):
                     new_leaf = create_substitution_leaf(leaf, dom_leaf, model)
                     push(new_leaf)
@@ -913,12 +933,12 @@ class expression(object):
             # -------------------------------------------------
 
             # Applying recursivity on field(one2many)
-            elif column._type == 'one2many' and operator == 'child_of':
+            elif column._type == 'one2many' and operator in ['child_of', 'parent_of']:
                 ids2 = to_ids(right, comodel, context)
                 if column._obj != model._name:
-                    dom = child_of_domain(left, ids2, comodel, prefix=column._obj)
+                    dom = parent_child_domain[operator](left, ids2, comodel, prefix=column._obj)
                 else:
-                    dom = child_of_domain('id', ids2, model, parent=left)
+                    dom = parent_child_domain[operator]('id', ids2, model, parent=left)
                 for dom_leaf in reversed(dom):
                     push(create_substitution_leaf(leaf, dom_leaf, model))
 
@@ -954,14 +974,14 @@ class expression(object):
             elif column._type == 'many2many':
                 rel_table, rel_id1, rel_id2 = column._sql_names(model)
                 #FIXME
-                if operator == 'child_of':
+                if operator in ['child_of', 'parent_of']:
                     def _rec_convert(ids):
                         if comodel == model:
                             return ids
                         return select_from_where(cr, rel_id1, rel_table, rel_id2, ids, operator)
 
                     ids2 = to_ids(right, comodel, context)
-                    dom = child_of_domain('id', ids2, comodel)
+                    dom = parent_child_domain[operator]('id', ids2, comodel)
                     ids2 = comodel.search(cr, uid, dom, context=context)
                     push(create_substitution_leaf(leaf, ('id', 'in', _rec_convert(ids2)), model))
                 else:
@@ -993,12 +1013,12 @@ class expression(object):
                         push(create_substitution_leaf(leaf, ('id', m2m_op, select_distinct_from_where_not_null(cr, rel_id1, rel_table)), model))
 
             elif column._type == 'many2one':
-                if operator == 'child_of':
+                if operator in ['child_of', 'parent_of']:
                     ids2 = to_ids(right, comodel, context)
                     if column._obj != model._name:
-                        dom = child_of_domain(left, ids2, comodel, prefix=column._obj)
+                        dom = parent_child_domain[operator](left, ids2, comodel, prefix=column._obj)
                     else:
-                        dom = child_of_domain('id', ids2, model, parent=left)
+                        dom = parent_child_domain[operator]('id', ids2, model, parent=left)
                     for dom_leaf in reversed(dom):
                         push(create_substitution_leaf(leaf, dom_leaf, model))
                 else:
